@@ -53,6 +53,16 @@ AUDIT_LOG = os.path.expanduser(os.environ.get("GOOGLE_ADS_WRITE_AUDIT_LOG", DEFA
 # anything that does not sit under such a campaign.
 MANAGED_LABEL = os.environ.get("GOOGLE_ADS_WRITE_MANAGED_LABEL", "claude-managed")
 
+# Account allowlist: the server only talks to the customer ids listed here
+# (comma separated, dashes optional). If the variable is empty or missing, EVERY
+# call is refused (fail closed).
+ALLOWED_CUSTOMERS_ENV = "GOOGLE_ADS_WRITE_ALLOWED_CUSTOMERS"
+
+
+def _allowed_customers() -> set:
+    raw = os.environ.get(ALLOWED_CUSTOMERS_ENV, "")
+    return {p.replace("-", "").strip() for p in raw.split(",") if p.replace("-", "").strip()}
+
 
 def _configure() -> Dict[str, str]:
     """Resolve credentials from env/defaults into the env vars the client reads.
@@ -72,6 +82,10 @@ def _configure() -> Dict[str, str]:
         "login_customer_id": os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "(none: direct accounts)",
         "audit_log": AUDIT_LOG,
         "managed_label": MANAGED_LABEL,
+        "allowed_customers": (
+            ", ".join(sorted(_allowed_customers()))
+            or f"MISSING (set {ALLOWED_CUSTOMERS_ENV}; until then every call is refused)"
+        ),
     }
 
 mcp = FastMCP(
@@ -115,7 +129,16 @@ def _get_client() -> GoogleAdsClient:
 
 
 def _cid(customer_id: Union[str, int]) -> str:
-    return str(customer_id).replace("-", "").strip()
+    cid = str(customer_id).replace("-", "").strip()
+    allowed = _allowed_customers()
+    if not allowed:
+        raise ValueError(
+            f"refused: {ALLOWED_CUSTOMERS_ENV} is not set, so no account is allowed. "
+            "Set it to the customer ids this server may use."
+        )
+    if cid not in allowed:
+        raise ValueError(f"refused: customer {cid} is not in {ALLOWED_CUSTOMERS_ENV}")
+    return cid
 
 
 def _audit(tool: str, customer_id: str, payload: Dict[str, Any], result: Dict[str, Any], applied: bool) -> None:
