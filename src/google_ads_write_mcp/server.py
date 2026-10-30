@@ -86,6 +86,9 @@ def _configure() -> Dict[str, str]:
             ", ".join(sorted(_allowed_customers()))
             or f"MISSING (set {ALLOWED_CUSTOMERS_ENV}; until then every call is refused)"
         ),
+        "campaign_guard": f"changes only on campaigns with label {MANAGED_LABEL!r} or listed ids",
+        "allowed_campaigns": ", ".join(sorted(_allowed_campaigns())) or "(none: only campaigns created by this server)",
+        "account_wide_actions": "allowed" if _account_wide_allowed() else "blocked",
     }
 
 mcp = FastMCP(
@@ -162,9 +165,229 @@ def _fail(tool: str, customer_id: str, payload: Dict[str, Any], msg: str) -> Dic
     return out
 
 
+# --------------------------------------------------------------------------- campaign guard
+# Writes are only allowed on campaigns that carry the managed label (created by this server)
+# or whose id is listed in GOOGLE_ADS_WRITE_ALLOWED_CAMPAIGNS. Checked before the request is
+# sent, also for dry runs. Unknown situations are refused (fail closed).
+import re as _re
+
+ALLOWED_CAMPAIGNS_ENV = "GOOGLE_ADS_WRITE_ALLOWED_CAMPAIGNS"
+ACCOUNT_WIDE_ENV = "GOOGLE_ADS_WRITE_ALLOW_ACCOUNT_WIDE"
+
+
+def _allowed_campaigns() -> set:
+    raw = os.environ.get(ALLOWED_CAMPAIGNS_ENV, "")
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _account_wide_allowed() -> bool:
+    return os.environ.get(ACCOUNT_WIDE_ENV, "").strip() == "1"
+
+
+_RN_SAFE = _re.compile(r"^[A-Za-z0-9_/~.\-]+$")
+
+
+def _rn_id(rn: str, pattern: str) -> Optional[str]:
+    m = _re.search(pattern, rn or "")
+    return m.group(1) if m else None
+
+
+class _CampaignGuard:
+    def __init__(self, client, cid: str):
+        self.c = client
+        self.cid = cid
+        self._camps = None
+        self._label = None
+        self._label_done = False
+
+    def _search(self, query: str):
+        ga = self.c.get_service("GoogleAdsService")
+        return list(ga.search(customer_id=self.cid, query=query))
+
+    def _campaigns(self) -> dict:
+        if self._camps is None:
+            rows = self._search(
+                "SELECT campaign.id, campaign.labels, campaign.campaign_budget, campaign.bidding_strategy "
+                "FROM campaign WHERE campaign.status != 'REMOVED'"
+            )
+            self._camps = {str(r.campaign.id): r.campaign for r in rows}
+        return self._camps
+
+    def writable(self, campaign_id: str) -> bool:
+        if campaign_id in _allowed_campaigns():
+            return True
+        camp = self._campaigns().get(campaign_id)
+        if camp is None:
+            return False
+        if not self._label_done:
+            self._label = _managed_label_rn(self.c, self.cid)
+            self._label_done = True
+        return bool(self._label) and self._label in list(camp.labels)
+
+    def budget_campaigns(self, rn: str) -> list:
+        return [i for i, cp in self._campaigns().items() if cp.campaign_budget == rn]
+
+    def strategy_campaigns(self, rn: str) -> list:
+        return [i for i, cp in self._campaigns().items() if cp.bidding_strategy == rn]
+
+    def ad_group_campaign(self, ad_group_id: str) -> Optional[str]:
+        rows = self._search(f"SELECT campaign.id FROM ad_group WHERE ad_group.id = {int(ad_group_id)}")
+        return str(rows[0].campaign.id) if rows else None
+
+    def ad_campaign(self, ad_id: str) -> Optional[str]:
+        rows = self._search(f"SELECT campaign.id FROM ad_group_ad WHERE ad_group_ad.ad.id = {int(ad_id)}")
+        return str(rows[0].campaign.id) if rows else None
+
+    def asset_campaigns(self, asset_rn: str) -> list:
+        if not _RN_SAFE.match(asset_rn or ""):
+            raise ValueError(f"unexpected asset resource name {asset_rn!r}")
+        ids = set()
+        for q in (
+            f"SELECT campaign.id FROM campaign_asset WHERE campaign_asset.asset = '{asset_rn}'",
+            f"SELECT campaign.id FROM ad_group_asset WHERE ad_group_asset.asset = '{asset_rn}'",
+        ):
+            for r in self._search(q):
+                ids.add(str(r.campaign.id))
+        return sorted(ids)
+
+
+def _describe_ops(operations) -> list:
+    out = []
+    for op in operations:
+        field = op._pb.WhichOneof("operation")
+        if not field:
+            out.append({"kind": "?", "action": "?", "rn": "", "campaign_ref": "", "ad_group_ref": ""})
+            continue
+        sub = getattr(op, field)
+        action = sub._pb.WhichOneof("operation")
+        target = getattr(sub, action) if action else None
+        if action == "remove":
+            rn, camp_ref, ag_ref = str(target), "", ""
+        elif target is not None:
+            rn = getattr(target, "resource_name", "") or ""
+            camp_ref = getattr(target, "campaign", "") or ""
+            ag_ref = getattr(target, "ad_group", "") or ""
+        else:
+            rn = camp_ref = ag_ref = ""
+        kind = field[: -len("_operation")] if field.endswith("_operation") else field
+        out.append({"kind": kind, "action": action or "?", "rn": rn, "campaign_ref": camp_ref, "ad_group_ref": ag_ref})
+    return out
+
+
+def _guard_eval(descs, g, account_wide: bool) -> Optional[str]:
+    hint = f"Only campaigns with the label {MANAGED_LABEL!r} or listed in {ALLOWED_CAMPAIGNS_ENV} may be changed."
+
+    def check_campaign(campaign_id, what):
+        if not campaign_id:
+            return f"refused: cannot tell which campaign this belongs to ({what}). {hint}"
+        if campaign_id.startswith("-"):
+            return None  # created in this same request
+        if not g.writable(campaign_id):
+            return f"refused: campaign {campaign_id} is not allowed ({what}). {hint}"
+        return None
+
+    def check_ad_group(ad_group_id, what):
+        if not ad_group_id:
+            return f"refused: cannot tell which ad group this belongs to ({what}). {hint}"
+        if ad_group_id.startswith("-"):
+            return None
+        return check_campaign(g.ad_group_campaign(ad_group_id), what)
+
+    def check_many(ids, what):
+        for i in ids:
+            err = check_campaign(i, what)
+            if err:
+                return err
+        return None
+
+    camp_pat = r"/campaigns/(-?\d+)$"
+    for d in descs:
+        kind, action, rn = d["kind"], d["action"], d["rn"]
+        what = f"{kind} {action} {rn}".strip()
+        creating = action == "create"
+        if creating and kind in ("label", "campaign", "campaign_budget", "bidding_strategy", "asset",
+                                 "custom_conversion_goal"):
+            continue
+        err = None
+        if kind == "campaign":
+            err = check_campaign(_rn_id(rn, camp_pat), what)
+        elif kind == "campaign_label":
+            ref = _rn_id(d["campaign_ref"], camp_pat) if creating else _rn_id(rn, r"/campaignLabels/(-?\d+)~")
+            err = check_campaign(ref, what)
+        elif kind == "campaign_criterion":
+            ref = _rn_id(d["campaign_ref"], camp_pat) if creating else _rn_id(rn, r"/campaignCriteria/(-?\d+)~")
+            err = check_campaign(ref, what)
+        elif kind == "campaign_asset":
+            ref = _rn_id(d["campaign_ref"], camp_pat) if creating else _rn_id(rn, r"/campaignAssets/(-?\d+)~")
+            err = check_campaign(ref, what)
+        elif kind == "ad_group":
+            if creating:
+                err = check_campaign(_rn_id(d["campaign_ref"], camp_pat), what)
+            else:
+                err = check_ad_group(_rn_id(rn, r"/adGroups/(-?\d+)$"), what)
+        elif kind == "ad_group_ad":
+            ref = _rn_id(d["ad_group_ref"], r"/adGroups/(-?\d+)$") if creating else _rn_id(rn, r"/adGroupAds/(-?\d+)~")
+            err = check_ad_group(ref, what)
+        elif kind == "ad_group_criterion":
+            ref = (_rn_id(d["ad_group_ref"], r"/adGroups/(-?\d+)$") if creating
+                   else _rn_id(rn, r"/adGroupCriteria/(-?\d+)~"))
+            err = check_ad_group(ref, what)
+        elif kind == "ad_group_asset":
+            ref = (_rn_id(d["ad_group_ref"], r"/adGroups/(-?\d+)$") if creating
+                   else _rn_id(rn, r"/adGroupAssets/(-?\d+)~"))
+            err = check_ad_group(ref, what)
+        elif kind == "ad":
+            ad_id = _rn_id(rn, r"/ads/(-?\d+)$")
+            err = check_campaign(g.ad_campaign(ad_id) if ad_id and not ad_id.startswith("-") else ad_id, what)
+        elif kind == "campaign_budget":
+            err = check_many(g.budget_campaigns(rn), what)
+        elif kind == "bidding_strategy":
+            err = check_many(g.strategy_campaigns(rn), what)
+        elif kind == "asset":
+            err = check_many(g.asset_campaigns(rn), what)
+        elif kind == "conversion_goal_campaign_config":
+            err = check_campaign(_rn_id(rn, r"/conversionGoalCampaignConfigs/(-?\d+)$"), what)
+        elif kind == "campaign_conversion_goal":
+            err = check_campaign(_rn_id(rn, r"/campaignConversionGoals/(-?\d+)~"), what)
+        elif kind in ("conversion_action", "custom_conversion_goal"):
+            if not account_wide:
+                err = (f"refused: {what} changes the whole account. "
+                       f"Set {ACCOUNT_WIDE_ENV}=1 to allow account-wide changes.")
+        else:
+            err = f"refused: unknown operation type {what!r}"
+        if err:
+            return err
+    return None
+
+
+def _guard_operations(c, cid: str, operations) -> Optional[str]:
+    return _guard_eval(_describe_ops(operations), _CampaignGuard(c, cid), _account_wide_allowed())
+
+
+def _guard_campaign_ids(c, cid: str, ids) -> Optional[str]:
+    g = _CampaignGuard(c, cid)
+    for i in ids:
+        if not g.writable(str(i)):
+            return (f"refused: campaign {i} is not allowed. Only campaigns with the label {MANAGED_LABEL!r} "
+                    f"or listed in {ALLOWED_CAMPAIGNS_ENV} may be changed.")
+    return None
+
+
+def _refused(tool: str, cid: str, payload: Dict[str, Any], msg: str) -> Dict[str, Any]:
+    out = {"status": "REFUSED_BY_GUARD", "error": msg}
+    _audit(tool, cid, payload, out, applied=False)
+    return out
+
+
 def _run_mutate(tool: str, customer_id: str, operations: list, confirm: bool, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send one atomic MutateGoogleAdsRequest. Dry run unless confirm."""
     c = _get_client()
+    try:
+        guard_err = _guard_operations(c, customer_id, operations)
+    except Exception as exc:  # fail closed
+        guard_err = f"refused: the campaign guard could not check this request ({type(exc).__name__}: {exc})"
+    if guard_err:
+        return _refused(tool, customer_id, payload, guard_err)
     svc = c.get_service("GoogleAdsService")
     req = c.get_type("MutateGoogleAdsRequest")
     req.customer_id = customer_id
@@ -2304,6 +2527,12 @@ def create_experiment(
     if not 1 <= int(traffic_split_percent) <= 99:
         return _fail(tool, cid, payload, "traffic_split_percent must be 1..99")
     c = _get_client()
+    try:
+        guard_err = _guard_campaign_ids(c, cid, [base_campaign_id])
+    except Exception as exc:  # fail closed
+        guard_err = f"refused: the campaign guard could not check this request ({type(exc).__name__}: {exc})"
+    if guard_err:
+        return _refused(tool, cid, payload, guard_err)
     exp_svc = c.get_service("ExperimentService")
     op = c.get_type("ExperimentOperation")
     exp = op.create
@@ -2381,6 +2610,10 @@ def _experiment_lifecycle(tool: str, customer_id: str, experiment_id: str, confi
     """Shared body for schedule/end/promote: same dry-run, error and audit handling."""
     cid = _cid(customer_id)
     payload = dict(experiment_id=str(experiment_id))
+    if not _account_wide_allowed():
+        return _refused(tool, cid, payload,
+                        f"refused: {tool} acts on an existing experiment/campaign. "
+                        f"Set {ACCOUNT_WIDE_ENV}=1 to allow it.")
     c = _get_client()
     svc = c.get_service("ExperimentService")
     rn = f"customers/{cid}/experiments/{experiment_id}"
